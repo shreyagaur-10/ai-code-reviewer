@@ -1,0 +1,356 @@
+# AI Code Reviewer -- CI/CD Pipeline
+# ──────────────────────────────────────────────────────────────────────────────
+# Jobs (run in order):
+#   1. test    -- run pytest; fail pipeline if any test fails
+#   2. build   -- build Docker image, push to GHCR tagged with git SHA + latest
+#   3. deploy  -- deploy to Railway, capture previous image tag for rollback
+#   4. verify  -- /health + /ready probe immediately after deploy
+#   5. canary  -- wait 10 min, query Prometheus error rate; rollback if > 5%
+#
+# Required GitHub Secrets (Settings -> Secrets -> Actions):
+#   GHCR_TOKEN         PAT with packages:write scope
+#   RAILWAY_TOKEN      Railway API token (from railway.app dashboard)
+#   GROQ_API_KEY       Groq API key for the deployed service
+#   WEBHOOK_SECRET     GitHub webhook HMAC secret
+#   RAILWAY_APP_URL    Full URL, e.g. https://my-app.up.railway.app
+#   PROMETHEUS_URL     Prometheus base URL, e.g. http://prom.up.railway.app:9090
+#   SLACK_WEBHOOK_URL  Incoming Webhook URL for rollback / stable notifications
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/ai-code-reviewer
+
+jobs:
+
+  # ── Job 1: Test ─────────────────────────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pytest
+        env:
+          WEBHOOK_SECRET: test-secret-for-ci
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GROQ_API_KEY: dummy-key-for-unit-tests
+          CHROMA_PERSIST_DIR: /tmp/chroma-test
+        run: |
+          pytest tests/ \
+            --tb=short \
+            --strict-markers \
+            -v \
+            --junit-xml=test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.xml
+
+  # ── Job 2: Build & Push Docker image ────────────────────────────────────────
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    outputs:
+      # Full GHCR image reference tagged with the git SHA (used for rollback)
+      sha-tag: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Use GitHub Actions cache to speed up repeated builds
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Build provenance for supply-chain security
+          provenance: true
+
+  # ── Job 3: Deploy to Railway ─────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Railway
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: ${{ secrets.RAILWAY_APP_URL }}
+
+    outputs:
+      # The previous stable tag -- retrieved from the LAST_STABLE_TAG Actions
+      # variable set by a prior canary run; used by canary for rollback.
+      previous-tag: ${{ steps.prev-tag.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Retrieve previous stable image tag
+        id: prev-tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Read repository variable "LAST_STABLE_TAG" set by a previous canary
+        # run.  Falls back to "latest" if the variable does not exist yet.
+        run: |
+          TAG=$(gh api \
+            "repos/${{ github.repository }}/actions/variables/LAST_STABLE_TAG" \
+            --jq '.value' 2>/dev/null || echo "latest")
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Previous stable tag: ${TAG}"
+
+      - name: Install Railway CLI
+        run: |
+          curl -fsSL https://railway.app/install.sh | sh
+          echo "$HOME/.railway/bin" >> $GITHUB_PATH
+
+      - name: Deploy to Railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: |
+          railway up \
+            --detach \
+            --service ai-code-reviewer
+
+      - name: Record deployed SHA
+        run: echo "Deployed commit ${{ github.sha }} to Railway"
+
+  # ── Job 4: Post-deploy verification ─────────────────────────────────────────
+  verify:
+    name: Verify Deployment
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Wait for Railway to become ready
+        run: |
+          echo "Sleeping 60 s for Railway to start the new revision..."
+          sleep 60
+
+      - name: Health check
+        env:
+          APP_URL: ${{ secrets.RAILWAY_APP_URL }}
+        run: |
+          echo "Hitting ${APP_URL}/health ..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${APP_URL}/health")
+          echo "HTTP status: ${STATUS}"
+          if [ "${STATUS}" != "200" ]; then
+            echo "Health check FAILED (HTTP ${STATUS})"
+            exit 1
+          fi
+          echo "Health check PASSED"
+
+      - name: Readiness check
+        env:
+          APP_URL: ${{ secrets.RAILWAY_APP_URL }}
+        run: |
+          echo "Hitting ${APP_URL}/ready ..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${APP_URL}/ready")
+          echo "HTTP status: ${STATUS}"
+          if [ "${STATUS}" != "200" ]; then
+            echo "Readiness probe returned ${STATUS} -- ChromaDB may still be initialising (non-fatal)"
+          fi
+          echo "Readiness check done"
+
+      - name: Immediate rollback on verify failure
+        if: failure()
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PREVIOUS_TAG: ${{ needs.deploy.outputs.previous-tag }}
+          NEW_TAG: ${{ needs.build.outputs.sha-tag }}
+        run: |
+          echo "Verify FAILED -- triggering immediate rollback to ${PREVIOUS_TAG}..."
+          curl -fsSL https://railway.app/install.sh | sh
+          echo "$HOME/.railway/bin" >> $GITHUB_PATH
+          railway rollback --service ai-code-reviewer
+
+          curl -s -X POST "${SLACK_WEBHOOK_URL}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \":rotating_light: *Immediate rollback triggered* -- health check failed\",
+              \"attachments\": [{
+                \"color\": \"danger\",
+                \"fields\": [
+                  {\"title\": \"Reason\",    \"value\": \"Health/readiness check failed\", \"short\": false},
+                  {\"title\": \"New tag\",   \"value\": \"${NEW_TAG}\",      \"short\": true},
+                  {\"title\": \"Old tag\",   \"value\": \"${PREVIOUS_TAG}\", \"short\": true}
+                ]
+              }]
+            }" || echo "Slack notification failed (non-fatal)"
+
+  # ── Job 5: Canary verification (10-minute error-rate check) ─────────────────
+  canary:
+    name: Canary -- Error Rate Check
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - deploy
+      - verify
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Wait 10 minutes for canary window
+        run: |
+          echo "Waiting 10 minutes to accumulate Groq error-rate data..."
+          sleep 600
+
+      # ── Query Prometheus for the Groq error rate ──────────────────────────
+      - name: Query Prometheus error rate
+        id: prom-query
+        env:
+          PROMETHEUS_URL: ${{ secrets.PROMETHEUS_URL }}
+        run: |
+          # PromQL: fraction of Groq calls that errored in last 10 minutes.
+          # Produces a value 0-1 (e.g. 0.07 = 7%).
+          QUERY='rate(groq_api_calls_total{status=~"error|rate_limited"}[10m]) / clamp_min(rate(groq_api_calls_total[10m]), 0.0001)'
+
+          RESPONSE=$(curl -s --fail \
+            "${PROMETHEUS_URL}/api/v1/query" \
+            --data-urlencode "query=${QUERY}" \
+            -G) || {
+            echo "Prometheus unreachable -- skipping error-rate check (assuming healthy)"
+            echo "error_rate=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          # Extract scalar value; default 0 if no time-series data yet
+          RATE=$(echo "${RESPONSE}" | \
+            jq -r '.data.result[0].value[1] // "0"' 2>/dev/null || echo "0")
+
+          # Convert to percentage rounded to 2 decimal places
+          PCT=$(python3 -c "print(round(float('${RATE}') * 100, 2))")
+          echo "Groq error rate over last 10 min: ${PCT}%"
+          echo "error_rate=${PCT}" >> "$GITHUB_OUTPUT"
+
+      # ── Rollback or mark stable ───────────────────────────────────────────
+      - name: Evaluate error rate -- rollback or mark stable
+        id: rollback-decision
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PREVIOUS_TAG: ${{ needs.deploy.outputs.previous-tag }}
+          NEW_TAG: ${{ needs.build.outputs.sha-tag }}
+          ERROR_RATE: ${{ steps.prom-query.outputs.error_rate }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          THRESHOLD=5.0
+          echo "Error rate: ${ERROR_RATE}%  |  Threshold: ${THRESHOLD}%"
+
+          NEEDS_ROLLBACK=$(python3 -c "print('yes' if float('${ERROR_RATE}') > ${THRESHOLD} else 'no')")
+
+          if [ "${NEEDS_ROLLBACK}" = "yes" ]; then
+            echo "::error::Groq error rate ${ERROR_RATE}% exceeds ${THRESHOLD}% -- rolling back"
+
+            # Install Railway CLI and roll back
+            curl -fsSL https://railway.app/install.sh | sh
+            echo "$HOME/.railway/bin" >> $GITHUB_PATH
+            railway rollback --service ai-code-reviewer
+            echo "Rollback command issued"
+
+            # Slack notification
+            curl -s -X POST "${SLACK_WEBHOOK_URL}" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"text\": \":rotating_light: *Canary rollback triggered* -- Groq error spike\",
+                \"attachments\": [{
+                  \"color\": \"danger\",
+                  \"fields\": [
+                    {\"title\": \"Error rate\",       \"value\": \"${ERROR_RATE}% (threshold: ${THRESHOLD}%)\", \"short\": false},
+                    {\"title\": \"Deployed tag\",     \"value\": \"${NEW_TAG}\",      \"short\": true},
+                    {\"title\": \"Rolled back to\",   \"value\": \"${PREVIOUS_TAG}\", \"short\": true},
+                    {\"title\": \"Workflow run\",     \"value\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\", \"short\": false}
+                  ]
+                }]
+              }" || echo "Slack notification failed (non-fatal)"
+
+            exit 1
+
+          else
+            echo "Error rate ${ERROR_RATE}% is within threshold -- deployment is STABLE"
+
+            # Update (or create) the LAST_STABLE_TAG repository variable so
+            # the next deploy job knows what to roll back to.
+            gh api \
+              --method PATCH \
+              "repos/${{ github.repository }}/actions/variables/LAST_STABLE_TAG" \
+              -f name="LAST_STABLE_TAG" \
+              -f value="${NEW_TAG}" \
+            || \
+            gh api \
+              --method POST \
+              "repos/${{ github.repository }}/actions/variables" \
+              -f name="LAST_STABLE_TAG" \
+              -f value="${NEW_TAG}"
+
+            echo "LAST_STABLE_TAG updated to ${NEW_TAG}"
+
+            # Slack success notification
+            curl -s -X POST "${SLACK_WEBHOOK_URL}" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"text\": \":white_check_mark: *Deployment stable* -- canary passed\",
+                \"attachments\": [{
+                  \"color\": \"good\",
+                  \"fields\": [
+                    {\"title\": \"Error rate\",  \"value\": \"${ERROR_RATE}%\", \"short\": true},
+                    {\"title\": \"Stable tag\",  \"value\": \"${NEW_TAG}\",     \"short\": true}
+                  ]
+                }]
+              }" || echo "Slack notification failed (non-fatal)"
+          fi

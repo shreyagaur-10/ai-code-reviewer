@@ -1,0 +1,55 @@
+# Prometheus scrape configuration for AI Code Reviewer
+# Reload without restart: curl -X POST http://localhost:9090/-/reload
+#
+# Targets:
+#   app        — FastAPI /metrics endpoint (prometheus-client)
+#   chromadb   — ChromaDB built-in metrics endpoint
+
+global:
+  scrape_interval: 15s        # default scrape frequency
+  evaluation_interval: 15s    # rule evaluation frequency
+  scrape_timeout: 10s
+
+  # Labels added to every time-series from this Prometheus instance
+  external_labels:
+    monitor: ai-code-reviewer
+
+# ── Alerting (placeholder — add Alertmanager in a later step) ────────────────
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+
+# ── Scrape configurations ────────────────────────────────────────────────────
+scrape_configs:
+
+  # Self-monitoring — Prometheus scrapes its own metrics
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090
+
+  # FastAPI application — exposes metrics via prometheus-client
+  - job_name: ai-code-reviewer-app
+    metrics_path: /metrics
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - app:8000         # service name from docker-compose
+        labels:
+          service: app
+          environment: production
+
+  # ChromaDB — built-in OpenTelemetry/Prometheus endpoint
+  # ChromaDB exposes metrics at :8000/metrics in recent versions.
+  # The service is named "chromadb" in docker-compose and runs on port 8000
+  # inside the reviewer-net network.
+  - job_name: chromadb
+    metrics_path: /metrics
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - chromadb:8000    # internal port (not the host-mapped 8001)
+        labels:
+          service: chromadb
+          environment: production

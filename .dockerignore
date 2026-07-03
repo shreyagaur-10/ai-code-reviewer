@@ -1,0 +1,56 @@
+# Files and directories to exclude from the Docker build context.
+# Keeping the build context small speeds up "docker build" significantly.
+
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Python bytecode and caches
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.tox
+
+# Virtual environments
+.venv
+venv
+env
+
+# Environment files — NEVER bake secrets into the image
+.env
+*.env
+
+# Test directory — not needed at runtime
+tests/
+test_*.py
+*_test.py
+
+# Development and documentation
+*.md
+docs/
+.docs/
+
+# CI/CD config — runtime image doesn't need workflow files
+.github/
+
+# Local data directories — mounted as volumes in production
+chroma_data/
+data/
+
+# Editor and OS artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
